@@ -11463,8 +11463,14 @@ impl RuntimeThreadManager {
         let (forked, _source_lease, target_lease) = self
             .bind_fork_to_own_session(forked, captured_source, prefix, covered_turn_id)
             .await?;
-        self.commit_staged_fork(&source, &forked, &cloned_records, sessions_dir, target_lease)
-            .await?;
+        self.commit_staged_fork(
+            &source,
+            &forked,
+            &cloned_records,
+            sessions_dir,
+            target_lease,
+        )
+        .await?;
 
         self.emit_event(
             &forked.id,
@@ -12360,7 +12366,12 @@ impl RuntimeThreadManager {
             (result, unpublished)
         })
         .await
-        .unwrap_or_else(|error| (Err(anyhow::anyhow!("fork cleanup task failed: {error}")), false));
+        .unwrap_or_else(|error| {
+            (
+                Err(anyhow::anyhow!("fork cleanup task failed: {error}")),
+                false,
+            )
+        });
         drop(admission);
         drop(target_lease);
         if unpublished && let Some(session_id) = thread.session_id.clone() {
