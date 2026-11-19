@@ -12346,20 +12346,24 @@ impl RuntimeThreadManager {
         };
         let store = self.store.clone();
         let thread_id = thread.id.clone();
-        let cleanup_result = tokio::task::spawn_blocking(move || {
-            Self::cleanup_unpublished_fork_in_store(
+        let (cleanup_result, unpublished) = tokio::task::spawn_blocking(move || {
+            let unpublished = store
+                .thread_path(&thread_id)
+                .is_ok_and(|path| matches!(path.try_exists(), Ok(false)));
+            let result = Self::cleanup_unpublished_fork_in_store(
                 &store,
                 &thread_id,
                 &saved_turn_ids,
                 &saved_item_ids,
                 commit_error,
-            )
+            );
+            (result, unpublished)
         })
         .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("fork cleanup task failed: {error}")));
+        .unwrap_or_else(|error| (Err(anyhow::anyhow!("fork cleanup task failed: {error}")), false));
         drop(admission);
         drop(target_lease);
-        if let Some(session_id) = thread.session_id.clone() {
+        if unpublished && let Some(session_id) = thread.session_id.clone() {
             let sessions_dir = sessions_dir.to_path_buf();
             let _ = tokio::task::spawn_blocking(move || {
                 crate::session_manager::SessionManager::new(sessions_dir)
