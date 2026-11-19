@@ -1238,7 +1238,8 @@ const REBINDING_BUILTINS: &[&str] = &[
 /// Shells whose `-c` argument is a command line to be parsed, not an operand.
 const SHELL_NAMES: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "ksh93", "mksh", "ash", "fish", "csh", "tcsh", "rbash",
-    "yash", "elvish", "nu", "xonsh", "oksh", "posh", "osh",
+    "yash", "elvish", "nu", "xonsh", "oksh", "posh", "osh", "oil", "ysh", "pdksh", "loksh", "rksh",
+    "ion", "ngs",
 ];
 
 /// The commands a shell line would run, plus what could not be resolved.
@@ -1399,6 +1400,9 @@ struct Line {
     odd: Vec<bool>,
     quoted: Vec<bool>,
     heredoc: bool,
+    /// The command's stdin is the previous pipeline stage: its text is
+    /// typed into whatever reads stdin (`ssh`'s remote shell, `pwsh -`).
+    stdin_piped: bool,
 }
 
 /// How a shell invocation receives its script.
@@ -1674,6 +1678,12 @@ impl Expander {
                     }
                     word.flush(&mut line);
                     word.redirect_operand = true;
+                    if c == '<' {
+                        // `<`, `<<<` and `<&` feed stdin from a file, a
+                        // string or a descriptor the scan cannot see; the
+                        // operand word is dropped, so stdin is runtime data.
+                        line.stdin_piped = true;
+                    }
                     i += redirection_len(&chars[i..]);
                 }
                 ' ' | '\t' => {
@@ -1721,6 +1731,11 @@ impl Expander {
                     word.flush(&mut line);
                     end_command(&mut commands, &mut line);
                     word.redirect_operand = false;
+                    if c == '|' {
+                        // `cmd | next` pipes text into next's stdin; `|&`
+                        // reaches this branch on the same character.
+                        line.stdin_piped = true;
+                    }
                     i += 1;
                     if c == '\n' && !heredocs.is_empty() {
                         let shell_stdin = commands.iter().any(|line| {
@@ -1730,7 +1745,18 @@ impl Expander {
                                 .any(|&head| {
                                     let name = command_name(&line.words[head]);
                                     SHELL_NAMES.contains(&name.as_str())
-                                        || matches!(name.as_str(), "source" | "." | "at" | "batch")
+                                        || matches!(
+                                            name.as_str(),
+                                            "source"
+                                                | "."
+                                                | "at"
+                                                | "batch"
+                                                | "ssh"
+                                                | "dbclient"
+                                                | "mosh"
+                                                | "pwsh"
+                                                | "powershell"
+                                        )
                                 })
                         });
                         for (delimiter, literal, strip_tabs) in heredocs.drain(..) {
@@ -1843,6 +1869,23 @@ impl Expander {
         }
         let mut dynamic = line.dynamic.clone();
         mark_replacement_operands(tokens, &heads.heads, &mut dynamic);
+        // Carry the `xargs` replacement marks into every child this record
+        // spawns (`--` tails, launcher commands): they sit only in the
+        // local copy otherwise, and `slice_line` reads `line.dynamic`.
+        let marked_line;
+        let line = if dynamic == line.dynamic {
+            line
+        } else {
+            marked_line = Line {
+                words: line.words.clone(),
+                dynamic: dynamic.clone(),
+                odd: line.odd.clone(),
+                quoted: line.quoted.clone(),
+                heredoc: line.heredoc,
+                stdin_piped: line.stdin_piped,
+            };
+            &marked_line
+        };
         for &head in &heads.heads {
             // `sudo rm -rf /` is an `rm -rf /`: emit the command the wrappers
             // run, with their options and operands removed.
@@ -1879,6 +1922,13 @@ impl Expander {
             let name = command_name(&tokens[head]);
             let args_dynamic = dynamic[head + 1..].iter().any(|dynamic| *dynamic);
             self.arguments_dynamic |= args_dynamic;
+            // A runtime-resolved word in a program position — `awk`'s or
+            // `sed`'s first operand, a script interpreter's `-e` value or
+            // script file — cannot be matched, so deny rules fail closed.
+            if script_operands_dynamic(&name, tokens, head, &dynamic) {
+                self.dynamic = true;
+                self.dropped = true;
+            }
             match name.as_str() {
                 // `eval …` takes a *command line* as data. Parse it.
                 "eval" | "iex" | "invoke-expression" => {
@@ -2007,7 +2057,15 @@ impl Expander {
                         self.dropped = true;
                     }
                 }
-                "powershell" | "pwsh" => self.record_powershell(tokens, head, &dynamic, depth),
+                "powershell" | "pwsh" => {
+                    // With no `-Command`, a bare `-` or piped stdin means
+                    // the script arrives on stdin, which cannot be scanned.
+                    if line.stdin_piped {
+                        self.dynamic = true;
+                        self.dropped = true;
+                    }
+                    self.record_powershell(line, head, &dynamic, depth);
+                }
                 _ if SHELL_NAMES.contains(&name.as_str()) => {
                     match shell_input(&name, &tokens[head..], &dynamic[head..]) {
                         ShellInput::Command(offsets) => {
@@ -2090,6 +2148,67 @@ impl Expander {
     ) {
         let tokens = &line.words;
         let mut truncated = false;
+        // `tmux -c` runs a shell command where the global spec consumes a
+        // value — but only *before* the verb (a sub-command's `-c` is a
+        // directory); `parallel --compress-program` names a program to
+        // exec; `bwrap --args FD` reads argv from a descriptor the scan
+        // cannot see.
+        if name == "tmux" {
+            let mut at = head + 1;
+            while at < tokens.len() && tokens[at].starts_with('-') && tokens[at] != "--" {
+                let flags = &tokens[at][1..];
+                let mut consumes = false;
+                for (idx, flag) in flags.char_indices() {
+                    if flag == 'c' {
+                        let rest = &flags[idx + flag.len_utf8()..];
+                        if rest.is_empty() {
+                            if let Some(value) = tokens.get(at + 1) {
+                                self.code_payload(value, dynamic[at + 1], depth);
+                            }
+                            consumes = true;
+                        } else {
+                            self.code_payload(rest, dynamic[at], depth);
+                        }
+                        break;
+                    }
+                    if TMUX_GLOBAL_SPEC.short_values.contains(flag) {
+                        consumes = idx + flag.len_utf8() == flags.len();
+                        break;
+                    }
+                }
+                at += if consumes { 2 } else { 1 };
+            }
+        } else if name == "parallel" {
+            for (payload, payload_dynamic) in option_payloads(
+                tokens,
+                head,
+                dynamic,
+                None,
+                &["compress-program", "decompress-program"],
+                true,
+            ) {
+                self.code_payload(&payload, payload_dynamic, depth);
+            }
+        } else if name == "bwrap" {
+            if tokens[head + 1..]
+                .iter()
+                .any(|token| token == "--args" || token.starts_with("--args="))
+            {
+                self.dynamic = true;
+                self.dropped = true;
+            }
+        } else if matches!(name, "docker" | "podman") {
+            // `buildx bake --call` evaluates a function expression whose
+            // result the scan cannot see.
+            if tokens.iter().any(|token| token == "buildx")
+                && tokens
+                    .iter()
+                    .any(|token| token == "--call" || token.starts_with("--call="))
+            {
+                self.dynamic = true;
+                self.dropped = true;
+            }
+        }
         match name {
             "nix" => {
                 for verb_idx in launcher_verb_targets(
@@ -2195,7 +2314,7 @@ impl Expander {
                     }
                 }
             }
-            "ssh" => {
+            "ssh" | "dbclient" | "mosh" => {
                 // `-o` payloads run even when the remote command is skipped
                 // (`ssh -N -o ProxyCommand=…` still executes it locally).
                 for (payload, payload_dynamic) in
@@ -2206,6 +2325,7 @@ impl Expander {
                 if ssh_skips_remote_command(&tokens[head + 1..], &dynamic[head + 1..]) {
                     return;
                 }
+                let mut remote_command = false;
                 for landing in resolve_wrapper_targets(
                     tokens,
                     dynamic,
@@ -2215,6 +2335,7 @@ impl Expander {
                     &mut truncated,
                 ) {
                     if landing < tokens.len() {
+                        remote_command = true;
                         let rest = &tokens[landing..];
                         let rest_dynamic = dynamic[landing..].iter().any(|d| *d);
                         self.code_payload(&rest.join(" "), rest_dynamic, depth);
@@ -2223,10 +2344,43 @@ impl Expander {
                         }
                     }
                 }
+                // With no remote command the remote shell runs whatever
+                // arrives on stdin — a pipe writes it, so the piped text is
+                // a command line the scan cannot see. (A heredoc body was
+                // already expanded by the stdin gate.)
+                if !remote_command && line.stdin_piped {
+                    self.dynamic = true;
+                    self.dropped = true;
+                }
             }
             "screen" => {
                 if screen_attaches_only(&tokens[head + 1..], &dynamic[head + 1..]) {
                     return;
+                }
+                // `-X` sends a screen command to a running session: `exec`,
+                // `eval` and `shell` run the rest, `at <win> <cmd>` after a
+                // window spec, and `stuff` types text that the session's
+                // shell then runs.
+                for at in head + 1..tokens.len() {
+                    if tokens[at] != "-X" {
+                        continue;
+                    }
+                    let rest = &tokens[at + 1..];
+                    let rest_dynamic = dynamic[at + 1..].iter().any(|d| *d);
+                    match rest.first().map(String::as_str) {
+                        Some("stuff") if rest.len() > 1 => {
+                            self.code_payload(&rest[1..].join(" "), rest_dynamic, depth);
+                        }
+                        Some("at") if rest.len() > 2 => {
+                            self.code_payload(&rest[2..].join(" "), rest_dynamic, depth);
+                        }
+                        Some(_) => {
+                            self.code_payload(&rest.join(" "), rest_dynamic, depth);
+                        }
+                        None => {
+                            self.dynamic |= dynamic[at];
+                        }
+                    }
                 }
                 for landing in resolve_wrapper_targets(
                     tokens,
@@ -2271,13 +2425,38 @@ impl Expander {
                         launcher.global,
                         &mut truncated,
                     ) {
-                        let Some(verb) = tokens.get(verb_idx).map(String::as_str) else {
+                        let mut verb_idx = verb_idx;
+                        let mut verb = tokens.get(verb_idx).map(String::as_str);
+                        // `docker container run` / `docker compose exec`: a
+                        // group name sits between the program and the verb.
+                        if launcher.groups.iter().any(|group| Some(*group) == verb) {
+                            verb_idx += 1;
+                            verb = tokens.get(verb_idx).map(String::as_str);
+                        }
+                        let Some(verb) = verb else {
                             continue;
                         };
                         if !launcher.verbs.contains(&verb) {
                             continue;
                         }
-                        let is_container_run = matches!(name, "docker" | "podman") && verb == "run";
+                        let is_container_run =
+                            matches!(name, "docker" | "podman") && matches!(verb, "run" | "create");
+                        if is_container_run {
+                            // `--health-cmd` runs under /bin/sh -c in the
+                            // container at health-check time.
+                            for at in verb_idx + 1..tokens.len() {
+                                if tokens[at] == "--" {
+                                    break;
+                                }
+                                if let Some(value) = tokens[at].strip_prefix("--health-cmd=") {
+                                    self.code_payload(value, dynamic[at], depth);
+                                } else if tokens[at] == "--health-cmd"
+                                    && let Some(value) = tokens.get(at + 1)
+                                {
+                                    self.code_payload(value, dynamic[at + 1], depth);
+                                }
+                            }
+                        }
                         let entrypoints_before = |end: usize| {
                             if !is_container_run {
                                 return Vec::new();
@@ -2337,8 +2516,14 @@ impl Expander {
                             if landing < tokens.len() {
                                 if launcher.shell_string {
                                     let rest = &tokens[landing..];
-                                    let rest_dynamic = dynamic[landing..].iter().any(|d| *d);
-                                    self.code_payload(&rest.join(" "), rest_dynamic, depth);
+                                    // Each operand is its own payload:
+                                    // `if-shell` takes two commands and
+                                    // `send-keys` sends each argument, so a
+                                    // join would hide every command but the
+                                    // first.
+                                    for (at, operand) in rest.iter().enumerate() {
+                                        self.code_payload(operand, dynamic[landing + at], depth);
+                                    }
                                     if rest.len() > 1 {
                                         self.record(&slice_line(line, landing), depth + 1);
                                     }
@@ -2470,13 +2655,8 @@ impl Expander {
     /// a bare operand may start code too (Windows PowerShell's default).
     /// PowerShell syntax is only approximated by the POSIX parser, which is
     /// enough to find the command words a deny rule names.
-    fn record_powershell(
-        &mut self,
-        tokens: &[String],
-        head: usize,
-        dynamic: &[bool],
-        depth: usize,
-    ) {
+    fn record_powershell(&mut self, line: &Line, head: usize, dynamic: &[bool], depth: usize) {
+        let tokens = &line.words;
         let rest = |at: usize| {
             (
                 tokens[at..].join(" "),
@@ -2497,6 +2677,9 @@ impl Expander {
             self.dropped |= dynamic[at];
             let option = option.to_ascii_lowercase();
             if option.is_empty() {
+                // A bare `-` reads the script from stdin.
+                self.dynamic |= tokens[at] == "-";
+                self.dropped |= tokens[at] == "-";
                 continue;
             }
             if "command".starts_with(option.as_str()) {
@@ -2556,6 +2739,7 @@ impl Expander {
                         odd: line.odd[start..end].to_vec(),
                         quoted: line.quoted[start..end].to_vec(),
                         heredoc: false,
+                        stdin_piped: false,
                     };
                     self.record(&payload, depth + 1);
                 }
@@ -2568,6 +2752,9 @@ impl Expander {
 
 struct VerbLauncher {
     program: &'static str,
+    /// Group names that sit between the program and the verb, as
+    /// `container` and `compose` do for `docker`.
+    groups: &'static [&'static str],
     verbs: &'static [&'static str],
     global: &'static Wrapper,
     subcmd: &'static Wrapper,
@@ -2969,6 +3156,61 @@ const DOCKER_EXEC_SPEC: Wrapper = Wrapper {
     operands: 1,
 };
 
+const KUBECTL_GLOBAL_SPEC: Wrapper = Wrapper {
+    name: "kubectl",
+    short_values: "nsv",
+    short_switches: "h",
+    long_values: &[
+        "as",
+        "as-group",
+        "as-uid",
+        "certificate-authority",
+        "client-certificate",
+        "client-key",
+        "cluster",
+        "context",
+        "kubeconfig",
+        "namespace",
+        "password",
+        "profile",
+        "profile-output",
+        "request-timeout",
+        "server",
+        "token",
+        "username",
+        "vmodule",
+    ],
+    long_switches: &[
+        "help",
+        "insecure-skip-tls-verify",
+        "show-managed-fields",
+        "version",
+    ],
+    operands: 0,
+};
+
+/// `kubectl exec [opts] POD [-c CONTAINER] -- COMMAND`: one operand (the
+/// pod) is consumed before the command words.
+const KUBECTL_EXEC_SPEC: Wrapper = Wrapper {
+    name: "kubectl-exec",
+    short_values: "cfF",
+    short_switches: "itqQ",
+    long_values: &[
+        "container",
+        "filename",
+        "pod-running-timeout",
+        "context",
+        "kubeconfig",
+        "namespace",
+        "server",
+        "as",
+        "token",
+        "request-timeout",
+    ],
+    long_switches: &["stdin", "tty", "quiet"],
+    operands: 1,
+};
+
 const TMUX_GLOBAL_SPEC: Wrapper = Wrapper {
     name: "tmux",
     short_values: "cfLST",
@@ -3008,6 +3250,7 @@ const SCREEN_SPEC: Wrapper = Wrapper {
 static VERB_LAUNCHERS: &[VerbLauncher] = &[
     VerbLauncher {
         program: "uv",
+        groups: &[],
         verbs: &["run"],
         global: &UV_GLOBAL_SPEC,
         subcmd: &UV_RUN_SPEC,
@@ -3015,6 +3258,7 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "poetry",
+        groups: &[],
         verbs: &["run"],
         global: &POETRY_SPEC,
         subcmd: &POETRY_SPEC,
@@ -3022,6 +3266,7 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "pipx",
+        groups: &[],
         verbs: &["run"],
         global: &PIPX_RUN_SPEC,
         subcmd: &PIPX_RUN_SPEC,
@@ -3029,6 +3274,7 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "bundle",
+        groups: &[],
         verbs: &["exec"],
         global: &BUNDLE_GLOBAL_SPEC,
         subcmd: &BUNDLE_EXEC_SPEC,
@@ -3036,6 +3282,7 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "bundler",
+        groups: &[],
         verbs: &["exec"],
         global: &BUNDLE_GLOBAL_SPEC,
         subcmd: &BUNDLE_EXEC_SPEC,
@@ -3043,6 +3290,7 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "perf",
+        groups: &[],
         verbs: &["stat", "record", "trace", "ftrace"],
         global: &PERF_GLOBAL_SPEC,
         subcmd: &PERF_SUB_SPEC,
@@ -3050,13 +3298,15 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "docker",
-        verbs: &["run"],
+        groups: &["container", "compose"],
+        verbs: &["run", "create"],
         global: &DOCKER_GLOBAL_SPEC,
         subcmd: &DOCKER_RUN_SPEC,
         shell_string: false,
     },
     VerbLauncher {
         program: "docker",
+        groups: &["container", "compose"],
         verbs: &["exec"],
         global: &DOCKER_GLOBAL_SPEC,
         subcmd: &DOCKER_EXEC_SPEC,
@@ -3064,20 +3314,31 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "podman",
-        verbs: &["run"],
+        groups: &["container"],
+        verbs: &["run", "create"],
         global: &DOCKER_GLOBAL_SPEC,
         subcmd: &DOCKER_RUN_SPEC,
         shell_string: false,
     },
     VerbLauncher {
         program: "podman",
+        groups: &["container"],
         verbs: &["exec"],
         global: &DOCKER_GLOBAL_SPEC,
         subcmd: &DOCKER_EXEC_SPEC,
         shell_string: false,
     },
     VerbLauncher {
+        program: "kubectl",
+        groups: &[],
+        verbs: &["exec"],
+        global: &KUBECTL_GLOBAL_SPEC,
+        subcmd: &KUBECTL_EXEC_SPEC,
+        shell_string: false,
+    },
+    VerbLauncher {
         program: "launchctl",
+        groups: &[],
         verbs: &["asuser", "bsexec"],
         global: &EMPTY_WRAPPER_SPEC,
         subcmd: &ONE_OPERAND_SPEC,
@@ -3085,6 +3346,7 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
     },
     VerbLauncher {
         program: "tmux",
+        groups: &[],
         verbs: &[
             "new-session",
             "new",
@@ -3096,6 +3358,14 @@ static VERB_LAUNCHERS: &[VerbLauncher] = &[
             "respawnp",
             "respawn-window",
             "respawnw",
+            "run-shell",
+            "run",
+            "send-keys",
+            "send",
+            "if-shell",
+            "if",
+            "pipe-pane",
+            "pipep",
         ],
         global: &TMUX_GLOBAL_SPEC,
         subcmd: &TMUX_SUB_SPEC,
@@ -3183,6 +3453,7 @@ fn slice_line(line: &Line, start: usize) -> Line {
         odd: line.odd[start..].to_vec(),
         quoted: line.quoted[start..].to_vec(),
         heredoc: false,
+        stdin_piped: line.stdin_piped,
     }
 }
 
@@ -3207,6 +3478,7 @@ fn build_prefixed_line(prefix: &str, prefix_idx: usize, line: &Line, rest_start:
         odd,
         quoted,
         heredoc: false,
+        stdin_piped: line.stdin_piped,
     }
 }
 
@@ -3281,14 +3553,37 @@ fn ssh_option_payloads(args: &[String], dynamic: &[bool]) -> Vec<(String, bool)>
                 .map(|rest| (rest, dynamic[i]))
         };
         if let Some((option, option_dynamic)) = option {
-            let (name, value) = match option.split_once(['=', ' ']) {
-                Some((name, value)) => (name, value),
+            // OpenSSH's strdelim skips leading whitespace (spaces and tabs),
+            // reads the name up to '=' or whitespace, then skips whitespace
+            // and an optional '=' before the value: ' ProxyCommand=…',
+            // 'PermitLocalCommand = yes' and tab separators parse the same.
+            let option = option.trim_start_matches([' ', '\t']);
+            let (name, value) = match option.find(['=', ' ', '\t']) {
+                Some(at) => {
+                    let name = &option[..at];
+                    let mut value = option[at..].trim_start_matches([' ', '\t']);
+                    if let Some(rest) = value.strip_prefix('=') {
+                        value = rest.trim_start_matches([' ', '\t']);
+                    }
+                    (name, value)
+                }
                 None => (option, ""),
             };
             match name.to_ascii_lowercase().as_str() {
                 "proxycommand" => payloads.push((value.to_string(), option_dynamic)),
                 "localcommand" => local.push((value.to_string(), option_dynamic)),
-                "permitlocalcommand" => permit_local |= value.eq_ignore_ascii_case("yes"),
+                // A flag argument is one whitespace-delimited word.
+                "permitlocalcommand" => {
+                    permit_local |= value
+                        .split([' ', '\t'])
+                        .next()
+                        .is_some_and(|yes| yes.eq_ignore_ascii_case("yes"))
+                }
+                _ if option_dynamic => {
+                    // A runtime-resolved -o value may be ProxyCommand=…: an
+                    // unmatched name cannot be ruled out statically.
+                    payloads.push((String::new(), true));
+                }
                 _ => {}
             }
         }
@@ -3357,7 +3652,9 @@ fn screen_attaches_only(args: &[String], dynamic: &[bool]) -> bool {
         for (at, flag) in flags.char_indices() {
             if flag == 'm' {
                 has_m = true;
-            } else if matches!(flag, 'r' | 'R' | 'X' | 'Q') {
+            } else if matches!(flag, 'r' | 'R') {
+                // `-X`/`-Q` send a command to a session rather than
+                // attaching, so they must not short-circuit the scan.
                 attach = true;
             }
             if SCREEN_SPEC.short_values.contains(flag) {
@@ -3543,6 +3840,115 @@ fn mark_replacement_operands(tokens: &[String], heads: &[usize], dynamic: &mut [
     }
 }
 
+/// A runtime-resolved word where a head expects its program — `sed -e`,
+/// `awk '{…}'`, `perl -e`, `python -c` — can hold a payload the scan never
+/// sees, so the head fails closed. `awk`'s and `sed`'s first operand is the
+/// program text itself; an interpreter's names a file whose contents the
+/// scan cannot see either way, so only `awk`/`sed` mark operands.
+fn script_operands_dynamic(name: &str, tokens: &[String], head: usize, dynamic: &[bool]) -> bool {
+    let (code_shorts, code_longs, value_shorts, value_longs, operand_is_script): (
+        &str,
+        &[&str],
+        &str,
+        &[&str],
+        bool,
+    ) = match name {
+        "sed" | "gsed" | "ssed" => (
+            "ef",
+            &["expression", "file"],
+            "",
+            &["regexp-extended"],
+            true,
+        ),
+        "awk" | "gawk" | "mawk" | "nawk" | "goawk" => (
+            "f",
+            &["file", "exec", "source"],
+            "FvW",
+            &[
+                "assign",
+                "field-separator",
+                "include",
+                "lint",
+                "load",
+                "profile",
+            ],
+            true,
+        ),
+        "perl" | "perl5" => ("eE", &[], "CIilmnpw", &["module"], false),
+        "ruby" | "jruby" => ("e", &[], "cCdEIKnprSTvwxy", &["encoding"], false),
+        "node" | "nodejs" | "bun" => ("ep", &["eval", "print"], "cr", &[], false),
+        "python" | "python2" | "python3" | "pypy" | "pypy3" | "micropython" => {
+            ("c", &[], "mOQsSVWx", &["module"], false)
+        }
+        "php" => ("r", &["r"], "aBcdefghiIlmnSv", &["define", "module"], false),
+        "lua" | "lua5" | "lua51" | "lua52" | "lua53" | "lua54" | "luajit" => {
+            ("e", &[], "ilLvW", &[], false)
+        }
+        "julia" => ("eE", &["eval", "print"], "ihLOpqStT", &["load"], false),
+        "rscript" | "Rscript" => ("e", &[], "fgv", &["file"], false),
+        _ => return false,
+    };
+    let mut script_seen = false;
+    let mut index = head + 1;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if let Some(long) = token.strip_prefix("--") {
+            let (flag, inline) = match long.split_once('=') {
+                Some((flag, value)) => (flag, Some(value)),
+                None => (long, None),
+            };
+            if code_longs.contains(&flag) {
+                script_seen = true;
+                let value_dynamic = match inline {
+                    Some(_) => dynamic[index],
+                    None => dynamic.get(index + 1).copied().unwrap_or(false),
+                };
+                if value_dynamic {
+                    return true;
+                }
+            }
+            if (code_longs.contains(&flag) || value_longs.contains(&flag)) && inline.is_none() {
+                index += 1;
+            }
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') && token.len() > 1 {
+            let flags = &token[1..];
+            for (at, flag) in flags.char_indices() {
+                let rest = &flags[at + flag.len_utf8()..];
+                if code_shorts.contains(flag) {
+                    script_seen = true;
+                    let value_dynamic = if rest.is_empty() {
+                        index += 1;
+                        dynamic.get(index).copied().unwrap_or(false)
+                    } else {
+                        dynamic[index]
+                    };
+                    if value_dynamic {
+                        return true;
+                    }
+                    break;
+                }
+                if value_shorts.contains(flag) {
+                    if rest.is_empty() {
+                        index += 1;
+                    }
+                    break;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    operand_is_script && !script_seen && index < tokens.len() && dynamic[index]
+}
+
 /// True unless the `$` is a literal one: it ends the word or precedes a
 /// separator. Everything else (`$v`, `$1`, `$@`, `$=v`, `$~v`, `$^v`, `$"…"`,
 /// and any flag character a shell may add) is read as an expansion.
@@ -3637,6 +4043,7 @@ fn end_command(commands: &mut Vec<Line>, line: &mut Line) {
     let line = std::mem::take(line);
     let mut piece = Line {
         heredoc: line.heredoc,
+        stdin_piped: line.stdin_piped,
         ..Line::default()
     };
     for (((word, dynamic), odd), quoted) in line

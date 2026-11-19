@@ -374,6 +374,80 @@ const HIDDEN_RM: &[&str] = &[
     // scripts (`s///e`, `system()`).
     "sed -- \"$X\"",
     "awk -- \"$X\"",
+    // OpenSSH `-o` values normalize whitespace around `=` and words.
+    "ssh -o 'PermitLocalCommand = yes' -o 'LocalCommand=rm x' host",
+    "ssh -o ' PermitLocalCommand=yes' -o 'LocalCommand=rm x' host",
+    "ssh -o 'PermitLocalCommand\t=\tyes' -o 'LocalCommand=rm x' host",
+    "ssh -o 'ProxyCommand = rm x' host",
+    "ssh -o 'ProxyCommand\trm x' host",
+    "ssh -o \"$OPT\" host",
+    // A remote shell runs whatever arrives on stdin.
+    "ssh host <<EOF\nrm x\nEOF",
+    "ssh host <<< 'rm x'",
+    "ssh host < cmds.sh",
+    "echo 'rm x' | ssh host",
+    "echo 'rm x' | mosh host",
+    "echo 'rm x' | dbclient host",
+    // PowerShell reads a bare `-` and piped stdin as a script.
+    "pwsh -",
+    "powershell -",
+    "pwsh <<EOF\nrm x\nEOF",
+    "echo 'rm x' | pwsh",
+    "echo 'rm x' | powershell",
+    // tmux `-c` is a command; the exec verbs run or type shell payloads.
+    "tmux -c 'rm x'",
+    "tmux run-shell 'rm x'",
+    "tmux run 'rm x'",
+    "tmux send-keys 'rm x' Enter",
+    "tmux if-shell 'true' 'rm x'",
+    "tmux pipe-pane 'rm x'",
+    // `screen -X` sends a command to a running session.
+    "screen -X screen rm x",
+    "screen -X exec rm x",
+    "screen -X eval 'rm x'",
+    "screen -X stuff 'rm x\n'",
+    "screen -X at 0 rm x",
+    // Nested docker/podman verbs and buildx.
+    "docker container run alpine rm x",
+    "docker container exec ctr rm x",
+    "podman container run alpine rm x",
+    "podman container exec ctr rm x",
+    "docker create alpine rm x",
+    "docker compose exec svc rm x",
+    "docker compose run svc rm x",
+    "docker buildx bake --call 'system(\"rm x\")'",
+    "docker run --health-cmd 'rm x' alpine",
+    // kubectl exec runs the words after the pod operand.
+    "kubectl exec pod rm x",
+    "kubectl exec pod -- rm x",
+    "kubectl exec -c ctr pod rm x",
+    "kubectl exec -n ns pod rm x",
+    // Shell-family aliases that take `-c`.
+    "oil -c 'rm x'",
+    "ysh -c 'rm x'",
+    "pdksh -c 'rm x'",
+    "loksh -c 'rm x'",
+    "rksh -c 'rm x'",
+    "ion -c 'rm x'",
+    "ngs -c 'rm x'",
+    // GNU Parallel execs the compress program; bwrap argv is fd-resident.
+    "parallel --compress-program 'rm x' ::: y",
+    "parallel --compress-program='rm x' ::: y",
+    "bwrap --args 3",
+    "bwrap --dev-bind / / --args=4",
+    // `xargs -I` marks its replacement words dynamic; a marked word in a
+    // script position (an `awk` program, a `-c` payload) cannot be scanned.
+    "xargs -I{} awk '{}'",
+    "xargs -I{} sh -c 'cat {}'",
+    "xargs -I{} sed -e '{}'",
+    // A runtime-resolved word in a script position fails closed.
+    "awk $PROG file",
+    "sed -e $PROG file",
+    "sed $PROG file",
+    "perl -e $PROG",
+    "python -c $PROG",
+    "node -e $PROG",
+    "ruby -e $PROG",
 ];
 
 /// Literal spellings that were already denied and must stay denied.
